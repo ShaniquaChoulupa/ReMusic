@@ -2,17 +2,20 @@ name: Build ReMusic
 on: [push, workflow_dispatch]
 jobs:
   build:
-    # Linux runner: Theos's own toolchain can still build 32-bit (armv7),
-    # which current Xcode on macOS no longer can.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Show the files the build can see
+        run: ls -la && ls -la layout || true
       - uses: Randomblock1/theos-action@v1
       - name: Build
-        run: make package FINALPACKAGE=1
+        run: |
+          set -o pipefail
+          make package FINALPACKAGE=1 2>&1 | tee build.log
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: ReMusic
           path: |
             packages/*.deb
-            .theos/obj/ReMusic.dylib
+            build.log
