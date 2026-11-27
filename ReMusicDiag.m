@@ -1,5 +1,5 @@
 // ReMusicDiag.m
-// ReMusic 0.1.3 - diagnostics for finding out how YouTube Music 3.47.4 sends its requests.
+// ReMusic 0.1.4 - diagnostics for finding out how YouTube Music 3.47.4 sends its requests.
 //
 // Writes two files into the app's Documents folder (next to TubeReplacer.log):
 //   ReMusic-methods.txt  - method + ivar list of the networking classes (written ~6s after launch)
@@ -18,6 +18,7 @@
 #include <stdint.h>
 #include <dispatch/dispatch.h>
 #include <dlfcn.h>
+#import <Security/Security.h>
 #include <mach-o/dyld.h>
 
 // ---------------------------------------------------------------------------------------------
@@ -868,7 +869,7 @@ static void RMWriteMethodDump(void) {
 
         NSMutableString *out = [NSMutableString stringWithCapacity:600000];
         NSDictionary *info = [[NSBundle mainBundle] infoDictionary];
-        [out appendFormat:@"ReMusic 0.1.3 method dump\napp %@ (%@)  iOS %@  %d classes loaded, %lu dumped\n",
+        [out appendFormat:@"ReMusic 0.1.4 method dump\napp %@ (%@)  iOS %@  %d classes loaded, %lu dumped\n",
          [info objectForKey:@"CFBundleShortVersionString"], [info objectForKey:@"CFBundleIdentifier"],
          [[NSProcessInfo processInfo] operatingSystemVersionString], total, (unsigned long)[sorted count]];
 
@@ -940,6 +941,12 @@ static void RMRunReset(void) {
             } else {
                 RMDiagLog(@"reset: no forget method found");
             }
+        }
+        {
+            NSDictionary *q = [NSDictionary dictionaryWithObjectsAndKeys:(id)kSecClassGenericPassword, (id)kSecClass,
+                               @"ReMusic.account", (id)kSecAttrService, nil];
+            OSStatus st = SecItemDelete((CFDictionaryRef)q);
+            RMDiagLog(@"reset: removed the saved account fields: %d", (int)st);
         }
         NSHTTPCookieStorage *cs = [NSHTTPCookieStorage sharedHTTPCookieStorage];
         NSUInteger nc = 0;
@@ -1081,7 +1088,7 @@ __attribute__((constructor)) static void RMDiagInit(void) {
             pthread_key_create(&gRMBusyKey, NULL);
             RMSetupLog();
             NSDictionary *info = [[NSBundle mainBundle] infoDictionary];
-            RMDiagLog(@"ReMusic 0.1.3 diagnostics start. app %@ bundle %@", [info objectForKey:@"CFBundleShortVersionString"],
+            RMDiagLog(@"ReMusic 0.1.4 diagnostics start. app %@ bundle %@", [info objectForKey:@"CFBundleShortVersionString"],
                       [info objectForKey:@"CFBundleIdentifier"]);
             static const char *key[] = {"YTInnerTubeRequestor", "YTMInnerTubeRequestor", "YTBaseInnerTubeService", "YTGRPCFetcherService",
                                         "YTGRPCFetcherTask", "GTMSessionFetcher", "Cronet", "GRPCCall2", "YTInnerTubeURLBuilderGRPC",

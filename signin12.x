@@ -10,6 +10,7 @@
 #import <objc/message.h>
 #import <UIKit/UIKit.h>
 #import <CommonCrypto/CommonDigest.h>
+#import <Security/Security.h>
 #include "general.h"
 #include "TRJSONUtils.h"
 
@@ -67,6 +68,43 @@ static void TRMarkSignedIn(id auth) {
     } @catch (NSException *e) { NSLog(@"[TubeReplacer] signin12: mark failed %@", e); }
 }
 
+// Our own copy of the signed-in account's cookie fields, kept in the keychain, in case the sign-in library
+// does not hand them back after the app is relaunched.
+static NSMutableDictionary *TRKeychainQuery(void) {
+    return [NSMutableDictionary dictionaryWithObjectsAndKeys:(id)kSecClassGenericPassword, (id)kSecClass,
+            @"ReMusic.account", (id)kSecAttrService, @"params", (id)kSecAttrAccount, nil];
+}
+
+static void TRPersistParams(NSDictionary *p) {
+    @try {
+        if (![p[@"SAPISID"] length] || ![NSJSONSerialization isValidJSONObject:p]) return;
+        NSData *d = [NSJSONSerialization dataWithJSONObject:p options:0 error:nil];
+        if (!d) return;
+        NSMutableDictionary *q = TRKeychainQuery();
+        SecItemDelete((CFDictionaryRef)q);
+        [q setObject:d forKey:(id)kSecValueData];
+        [q setObject:(id)kSecAttrAccessibleAfterFirstUnlock forKey:(id)kSecAttrAccessible];
+        OSStatus st = SecItemAdd((CFDictionaryRef)q, NULL);
+        NSLog(@"[ReMusic] saved the account fields to the keychain: %d", (int)st);
+    } @catch (NSException *e) {}
+}
+
+static NSDictionary *TRLoadPersistedParams(void) {
+    static NSDictionary *cached = nil;
+    if (cached) return cached;
+    @try {
+        NSMutableDictionary *q = TRKeychainQuery();
+        [q setObject:(id)kCFBooleanTrue forKey:(id)kSecReturnData];
+        [q setObject:(id)kSecMatchLimitOne forKey:(id)kSecMatchLimit];
+        CFTypeRef out = NULL;
+        if (SecItemCopyMatching((CFDictionaryRef)q, &out) != errSecSuccess || !out) return nil;
+        NSData *d = [(NSData *)out autorelease];
+        id j = [NSJSONSerialization JSONObjectWithData:d options:0 error:nil];
+        if ([j isKindOfClass:[NSDictionary class]]) cached = [j retain];
+    } @catch (NSException *e) {}
+    return cached;
+}
+
 extern NSDictionary *gTRLastAccountParams;
 
 %hook SSOLoginScopedAuthorization
@@ -80,6 +118,7 @@ extern NSDictionary *gTRLastAccountParams;
     [p removeAllObjects];
     if ([params isKindOfClass:[NSDictionary class]]) [p addEntriesFromDictionary:params];
     { NSDictionary *old = gTRLastAccountParams; gTRLastAccountParams = [p copy]; [old release]; }
+    TRPersistParams(p);
     TRMarkSignedIn(self);
 }
 
@@ -564,4 +603,102 @@ static BOOL TRProcessSignInCookies(id signIn, id cookieStorage) {
     NSLog(@"[TubeReplacer] innertube error: %@", error);
     %orig;
 }
+%end
+
+// ---------------------------------------------------------------------------------------------
+// Music 3.47.4: requests are authorized by SSOAuthorizationImpl (a scoped token wrapper), which asks Google for
+// an OAuth access token that this cookie-based sign-in can never provide, so every request failed with
+// com.google.sso -214 before it was sent. Authorize those requests with the cookies of the signed-in account instead.
+// ---------------------------------------------------------------------------------------------
+
+@interface NSObject (TRScopedAuth)
+- (id)identity;
+- (id)auth;
+@end
+
+static BOOL TRApplyCookieAuth(NSDictionary *p, NSMutableURLRequest *request) {
+    NSString *sid = p[@"SID"], *hsid = p[@"HSID"], *ssid = p[@"SSID"], *sapisid = p[@"SAPISID"];
+    NSString *sidcc = p[@"SIDCC"], *datasyncID = p[@"DATASYNC_ID"], *pageID = p[@"PAGE_ID"], *loginInfo = p[@"LOGIN_INFO"];
+    if (![hsid length] || ![ssid length] || ![sapisid length] || ![sid length] || ![datasyncID length] || !request) return NO;
+    [request setHTTPShouldHandleCookies:NO];
+    NSMutableString *cookie = [NSMutableString stringWithFormat:@"hideBrowserUpgradeBox=true; HSID=%@; SSID=%@; SAPISID=%@; __Secure-3PAPISID=%@; SID=%@", hsid, ssid, sapisid, sapisid, sid];
+    if ([sidcc length]) [cookie appendFormat:@"; SIDCC=%@", sidcc];
+    if ([loginInfo length]) [cookie appendFormat:@"; LOGIN_INFO=%@", loginInfo];
+    [request setValue:cookie forHTTPHeaderField:@"Cookie"];
+    NSURL *u = [request URL];
+    // the web origin the signature is made for: the API host itself is not one, so use Music's
+    NSString *origin = [NSString stringWithFormat:@"%@://%@", [u scheme], [u host]];
+    if ([[u host] hasSuffix:@"googleapis.com"]) origin = @"https://music.youtube.com";
+    long now = (long)[[NSDate date] timeIntervalSince1970];
+    NSString *toHash = nil;
+    for (NSString *c in [datasyncID componentsSeparatedByString:@"||"]) if ([c length]) toHash = c;
+    NSString *src = [NSString stringWithFormat:@"%@ %ld %@ %@", toHash, now, sapisid, origin];
+    NSData *sd = [src dataUsingEncoding:NSUTF8StringEncoding];
+    uint8_t dg[CC_SHA1_DIGEST_LENGTH];
+    CC_SHA1([sd bytes], (CC_LONG)[sd length], dg);
+    NSMutableString *hex = [NSMutableString string];
+    for (int i = 0; i < CC_SHA1_DIGEST_LENGTH; i++) [hex appendFormat:@"%02x", dg[i]];
+    [request setValue:[NSString stringWithFormat:@"SAPISIDHASH %ld_%@_u", now, hex] forHTTPHeaderField:@"Authorization"];
+    [request setValue:origin forHTTPHeaderField:@"Origin"];
+    [request setValue:@"0" forHTTPHeaderField:@"X-Goog-AuthUser"];
+    if ([pageID length]) [request setValue:pageID forHTTPHeaderField:@"X-Goog-PageId"];
+    return YES;
+}
+
+// the signed-in account's cookie fields: from the identity's own login authorization, or the last sign-in as a fallback
+static NSDictionary *TRScopedParams(id scoped) {
+    NSDictionary *p = nil;
+    @try {
+        id ident = [scoped respondsToSelector:@selector(identity)] ? [scoped identity] : nil;
+        id la = [ident respondsToSelector:@selector(auth)] ? [ident auth] : nil;
+        if (la) p = TRParams(la);
+    } @catch (NSException *e) {}
+    if (![p[@"SAPISID"] length] && [gTRLastAccountParams[@"SAPISID"] length]) p = gTRLastAccountParams;
+    if (![p[@"SAPISID"] length]) {
+        p = TRLoadPersistedParams();
+        static int n = 0;
+        if (n++ < 3) NSLog(@"[ReMusic] account fields were not in the identity, keychain copy %@", [p[@"SAPISID"] length] ? @"found" : @"missing");
+    }
+    return p;
+}
+
+%hook SSOAuthorizationImpl
+
+-(BOOL)canAuthorize {
+    NSDictionary *p = TRScopedParams(self);
+    return [p[@"SID"] length] && [p[@"SAPISID"] length] && [p[@"DATASYNC_ID"] length];
+}
+
+-(BOOL)hasToken { return YES; }
+-(id)accessToken { return kTRDummy; }
+-(id)tokenExpirationDate { return [NSDate dateWithTimeIntervalSinceNow:100000000]; }
+-(void)primeForRefresh { }
+
+-(void)refreshAccessTokenWithCompletionHandler:(void (^)(NSError *))handler {
+    if (handler) handler(nil);
+}
+
+-(void)authorizeRequest:(NSMutableURLRequest *)request completionHandler:(void (^)(NSError *))handler {
+    BOOL ok = TRApplyCookieAuth(TRScopedParams(self), request);
+    static int n = 0;
+    if (n++ < 12) NSLog(@"[ReMusic] scoped authorize %@ -> %d", [[request URL] path], ok);
+    NSError *err = ok ? nil : [NSError errorWithDomain:@"com.google.sso" code:-1001 userInfo:nil];
+    if (handler) handler(err);
+}
+
+// not expected to be used (the two forms above are the public ones); log it if something does call it
+-(void)authorizeRequest:(NSMutableURLRequest *)request callback:(id)callback {
+    static int n = 0;
+    if (n++ < 5) NSLog(@"[ReMusic] scoped authorize(callback) %@ called", [[request URL] path]);
+    %orig;
+}
+
+-(void)authorizeRequest:(NSMutableURLRequest *)request delegate:(id)delegate didFinishSelector:(SEL)sel {
+    BOOL ok = TRApplyCookieAuth(TRScopedParams(self), request);
+    static int n = 0;
+    if (n++ < 12) NSLog(@"[ReMusic] scoped authorize(delegate) %@ -> %d", [[request URL] path], ok);
+    NSError *err = ok ? nil : [NSError errorWithDomain:@"com.google.sso" code:-1001 userInfo:nil];
+    if (delegate && sel) ((void (*)(id, SEL, id, id, id))objc_msgSend)(delegate, sel, self, request, err);
+}
+
 %end
