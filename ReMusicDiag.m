@@ -1,5 +1,5 @@
 // ReMusicDiag.m
-// ReMusic 0.1.1 - diagnostics for finding out how YouTube Music 3.47.4 sends its requests.
+// ReMusic 0.1.2 - diagnostics for finding out how YouTube Music 3.47.4 sends its requests.
 //
 // Writes two files into the app's Documents folder (next to TubeReplacer.log):
 //   ReMusic-methods.txt  - method + ivar list of the networking classes (written ~6s after launch)
@@ -658,7 +658,7 @@ static void RMWriteMethodDump(void) {
 
         NSMutableString *out = [NSMutableString stringWithCapacity:600000];
         NSDictionary *info = [[NSBundle mainBundle] infoDictionary];
-        [out appendFormat:@"ReMusic 0.1.1 method dump\napp %@ (%@)  iOS %@  %d classes loaded, %lu dumped\n",
+        [out appendFormat:@"ReMusic 0.1.2 method dump\napp %@ (%@)  iOS %@  %d classes loaded, %lu dumped\n",
          [info objectForKey:@"CFBundleShortVersionString"], [info objectForKey:@"CFBundleIdentifier"],
          [[NSProcessInfo processInfo] operatingSystemVersionString], total, (unsigned long)[sorted count]];
 
@@ -693,6 +693,98 @@ static void RMWriteMethodDump(void) {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Fresh-install reset
+//
+// iOS keeps an app's keychain items when the app is deleted, so after reinstalling Music the old
+// (now unusable) sign-in is still there while the app's own data is gone, and the app flashes sign-in
+// errors forever. When Music's Documents folder has no ReMusic-session.marker (fresh install, or the
+// manual file ReMusic-reset exists), the stored accounts are forgotten once so you can sign in cleanly.
+// ---------------------------------------------------------------------------------------------
+
+static BOOL gRMFresh = NO;
+static id gRMService = nil;
+static IMP rm_o_sso_init = NULL;
+static BOOL gRMResetScheduled = NO;
+
+static void RMRunReset(void) {
+    id svc = gRMService;
+    @try {
+        if (!svc) {
+            RMDiagLog(@"reset: SSOService was never created, nothing to do");
+            return;
+        }
+        NSArray *ids = [svc respondsToSelector:@selector(allIdentities)] ? [svc performSelector:@selector(allIdentities)] : nil;
+        RMDiagLog(@"reset: %lu stored account(s) found", (unsigned long)[ids count]);
+        SEL f3 = NSSelectorFromString(@"forgetIdentity:revokeToken:callback:");
+        SEL f2 = NSSelectorFromString(@"forgetIdentity:callback:");
+        for (id ident in [NSArray arrayWithArray:ids]) {
+            id cb = [[^(id a, id b) {
+                RMDiagLog(@"reset: forget callback %@", a);
+            } copy] autorelease];
+            if ([svc respondsToSelector:f3]) {
+                ((void (*)(id, SEL, id, BOOL, id))objc_msgSend)(svc, f3, ident, NO, cb);
+                RMDiagLog(@"reset: forgot an account (forgetIdentity:revokeToken:callback:)");
+            } else if ([svc respondsToSelector:f2]) {
+                ((void (*)(id, SEL, id, id))objc_msgSend)(svc, f2, ident, cb);
+                RMDiagLog(@"reset: forgot an account (forgetIdentity:callback:)");
+            } else {
+                RMDiagLog(@"reset: no forget method found");
+            }
+        }
+        NSHTTPCookieStorage *cs = [NSHTTPCookieStorage sharedHTTPCookieStorage];
+        NSUInteger nc = 0;
+        for (NSHTTPCookie *c in [NSArray arrayWithArray:[cs cookies]]) {
+            [cs deleteCookie:c];
+            nc++;
+        }
+        RMDiagLog(@"reset: removed %lu cookies", (unsigned long)nc);
+    } @catch (NSException *e) {
+        RMDiagLog(@"reset: exception %@", e);
+    }
+    // check again a moment later, then write the marker so this only happens once
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+        @try {
+            id s2 = gRMService;
+            NSArray *left = [s2 respondsToSelector:@selector(allIdentities)] ? [s2 performSelector:@selector(allIdentities)] : nil;
+            RMDiagLog(@"reset: %lu account(s) left after reset", (unsigned long)[left count]);
+        } @catch (NSException *e) {
+        }
+        [[NSFileManager defaultManager] removeItemAtPath:RMPath(@"ReMusic-reset") error:nil];
+        [[NSFileManager defaultManager] createFileAtPath:RMPath(@"ReMusic-session.marker") contents:nil attributes:nil];
+        RMDiagLog(@"reset: done, marker written. Sign in again now.");
+    });
+}
+
+static id rm_sso_init(id self, SEL _cmd, id config) {
+    id r = ((id (*)(id, SEL, id))rm_o_sso_init)(self, _cmd, config);
+    if (r && gRMFresh && !gRMResetScheduled) {
+        gRMResetScheduled = YES;
+        gRMService = [r retain];
+        RMDiagLog(@"reset: captured SSOService, resetting in 2s");
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+            RMRunReset();
+        });
+    }
+    return r;
+}
+
+static void RMInstallReset(void) {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    BOOL haveMarker = [fm fileExistsAtPath:RMPath(@"ReMusic-session.marker")];
+    BOOL manual = [fm fileExistsAtPath:RMPath(@"ReMusic-reset")];
+    gRMFresh = !haveMarker || manual;
+    RMDiagLog(@"reset: marker %@, manual flag %@ -> %@", haveMarker ? @"present" : @"missing", manual ? @"present" : @"no",
+              gRMFresh ? @"will reset stored accounts" : @"leaving accounts alone");
+    if (!gRMFresh) return;
+    Class sso = NSClassFromString(@"SSOService");
+    BOOL ok = RMReplace(sso, @selector(initWithConfiguration:), (IMP)rm_sso_init, &rm_o_sso_init);
+    RMDiagLog(@"reset: hook SSOService initWithConfiguration: %d", ok);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 12 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+        if (!gRMResetScheduled) RMDiagLog(@"reset: SSOService was not created within 12s, no reset done");
+    });
+}
+
+// ---------------------------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------------------------
 
@@ -702,14 +794,19 @@ __attribute__((constructor)) static void RMDiagInit(void) {
             pthread_key_create(&gRMBusyKey, NULL);
             RMSetupLog();
             NSDictionary *info = [[NSBundle mainBundle] infoDictionary];
-            RMDiagLog(@"ReMusic 0.1.1 diagnostics start. app %@ bundle %@", [info objectForKey:@"CFBundleShortVersionString"],
+            RMDiagLog(@"ReMusic 0.1.2 diagnostics start. app %@ bundle %@", [info objectForKey:@"CFBundleShortVersionString"],
                       [info objectForKey:@"CFBundleIdentifier"]);
             static const char *key[] = {"YTInnerTubeRequestor", "YTMInnerTubeRequestor", "YTBaseInnerTubeService", "YTGRPCFetcherService",
                                         "YTGRPCFetcherTask", "GTMSessionFetcher", "Cronet", "GRPCCall2", "YTInnerTubeURLBuilderGRPC",
                                         "YTInnerTubeURLBuilderStubby", "GPBMessage", NULL};
             for (int i = 0; key[i]; i++) RMDiagLog(@"class %s: %@", key[i], objc_getClass(key[i]) ? @"present" : @"missing");
             RMHookNetwork();
-            RMInstallTracer();
+            RMInstallReset();
+            if (gRMFresh) {
+                RMDiagLog(@"trace: skipped on this launch (first launch after a reinstall/reset). It starts on the next launch.");
+            } else {
+                RMInstallTracer();
+            }
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 6 * NSEC_PER_SEC), dispatch_get_global_queue(0, 0), ^{
                 RMWriteMethodDump();
             });
