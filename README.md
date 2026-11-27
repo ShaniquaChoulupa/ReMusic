@@ -1,4 +1,4 @@
-# ReMusic 0.1.5
+# ReMusic 0.1.6
 Cookie-based sign-in for old YouTube Music (3.47.4, iOS 10), reusing TubeReplacer's sign-in code
 (https://github.com/Preloading/TubeReplacer by Preloading, GPLv3). This project is GPLv3 too.
 
@@ -35,3 +35,9 @@ request, so it shows whether YouTube accepts requests authorized this way.
 0.1.4, so requests still could not be authorized. They are now rebuilt from the cookie jar the sign-in used and the
 account id the identity stores, so no new sign-in is needed. Only the SAPISID cookie is required; the rest is sent if
 present. ReMusic-diag.log shows the server's answer to each request.
+
+0.1.6: the "Choose an account" page at sign-in could come up empty. The list is now read more tolerantly, what the
+server answered is written to TubeReplacer.log ("[ReMusic] account list: ..."), and if no account can be read a single
+"Continue" entry for the main account is shown so the sign-in can finish. Signed requests are now made in up to four
+ways (which web address the signature is made for, with or without the user id); when YouTube refuses one with 401/403
+the next is used, and the first one that gets an answer is remembered (NSUserDefaults key ReMusicAuthVariant).

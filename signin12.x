@@ -360,6 +360,54 @@ static BOOL TRProcessSignInCookies(id signIn, id cookieStorage) {
     return YES;
 }
 
+// ---- helpers for the account chooser ----
+static void TRCollectAccountItems(id node, NSMutableArray *out, int depth) {
+    if (depth > 40) return;
+    if ([node isKindOfClass:[NSDictionary class]]) {
+        id ai = [node objectForKey:@"accountItem"];
+        if ([ai isKindOfClass:[NSDictionary class]] && [ai objectForKey:@"accountName"]) { [out addObject:node]; return; }
+        for (id v in [node allValues]) TRCollectAccountItems(v, out, depth + 1);
+    } else if ([node isKindOfClass:[NSArray class]]) {
+        for (id v in node) TRCollectAccountItems(v, out, depth + 1);
+    }
+}
+
+static NSString *TRFindString(id node, NSString *key, int depth) {
+    if (depth > 20) return nil;
+    if ([node isKindOfClass:[NSDictionary class]]) {
+        id v = [node objectForKey:key];
+        if ([v isKindOfClass:[NSString class]] && [v length]) return v;
+        for (id c in [node allValues]) { NSString *r = TRFindString(c, key, depth + 1); if (r) return r; }
+    } else if ([node isKindOfClass:[NSArray class]]) {
+        for (id c in node) { NSString *r = TRFindString(c, key, depth + 1); if (r) return r; }
+    }
+    return nil;
+}
+
+static NSString *TRTextOf(id n) {
+    if ([n isKindOfClass:[NSString class]]) return n;
+    if ([n isKindOfClass:[NSDictionary class]]) {
+        id st = [n objectForKey:@"simpleText"];
+        if ([st isKindOfClass:[NSString class]]) return st;
+        id runs = [n objectForKey:@"runs"];
+        if ([runs isKindOfClass:[NSArray class]]) {
+            NSMutableString *r = [NSMutableString string];
+            for (id run in runs) { id t = [run isKindOfClass:[NSDictionary class]] ? [run objectForKey:@"text"] : nil; if ([t isKindOfClass:[NSString class]]) [r appendString:t]; }
+            return r;
+        }
+    }
+    return @"";
+}
+
+static NSString *TRHTMLEscape(NSString *s) {
+    s = [s stringByReplacingOccurrencesOfString:@"&" withString:@"&amp;"];
+    s = [s stringByReplacingOccurrencesOfString:@"<" withString:@"&lt;"];
+    s = [s stringByReplacingOccurrencesOfString:@">" withString:@"&gt;"];
+    s = [s stringByReplacingOccurrencesOfString:@"\"" withString:@"&quot;"];
+    s = [s stringByReplacingOccurrencesOfString:@"'" withString:@"&#39;"];
+    return s;
+}
+
 %hook SSOOAuth2SignIn
 
 %new
@@ -377,45 +425,62 @@ static BOOL TRProcessSignInCookies(id signIn, id cookieStorage) {
           htmlString = [NSString stringWithFormat:@"<html><body>Something went wrong. %@", error];
           NSLog(@"Error: %@", error.localizedDescription);
       } else {
-          NSData *cleanData = [NSData dataWithBytes:([data bytes] + 5) length:([data length]-5)];
-          NSDictionary *json = [NSJSONSerialization JSONObjectWithData:cleanData options:NSJSONReadingMutableContainers error:nil];
+          // the answer starts with a short guard prefix ()]}') that has changed before: parse from the first brace
+          NSData *cleanData = data;
+          {
+              const char *bytes = [data bytes];
+              NSUInteger len = [data length], at = 0;
+              while (at < len && bytes[at] != '{' && bytes[at] != '[') at++;
+              if (at < len) cleanData = [data subdataWithRange:NSMakeRange(at, len - at)];
+          }
+          id json = [cleanData length] ? [NSJSONSerialization JSONObjectWithData:cleanData options:NSJSONReadingMutableContainers error:nil] : nil;
 
-          NSArray *accounts = [TRJSONUtils arrayFromJSON:json keyPath:@"data.actions[0].getMultiPageMenuAction.menu.multiPageMenuRenderer.sections[0].accountSectionListRenderer.contents[0].accountItemSectionRenderer.contents"];
+          NSMutableArray *accounts = [NSMutableArray array];
+          NSArray *expected = [TRJSONUtils arrayFromJSON:json keyPath:@"data.actions[0].getMultiPageMenuAction.menu.multiPageMenuRenderer.sections[0].accountSectionListRenderer.contents[0].accountItemSectionRenderer.contents"];
+          if ([expected count]) [accounts addObjectsFromArray:expected];
+          else TRCollectAccountItems(json, accounts, 0); // the layout moved: look for the account entries anywhere
 
-          // int index = -1;
-          
+          {
+              NSMutableString *head = [NSMutableString string];
+              NSUInteger n = MIN((NSUInteger)120, [data length]);
+              const unsigned char *b = [data bytes];
+              for (NSUInteger i = 0; i < n; i++) [head appendFormat:@"%c", (b[i] >= 32 && b[i] < 127) ? b[i] : '.'];
+              NSLog(@"[ReMusic] account list: HTTP %ld, %lu bytes, json=%d, %lu account(s) found, starts: %@",
+                    (long)([response isKindOfClass:[NSHTTPURLResponse class]] ? [(NSHTTPURLResponse *)response statusCode] : 0),
+                    (unsigned long)[data length], json != nil, (unsigned long)[accounts count], head);
+          }
+
           NSMutableString *allAccountsHTML = [[NSMutableString alloc] init];
           for (NSDictionary *account in accounts) {
-              if (![TRJSONUtils stringFromJSON:account keyPath:@"accountItem.accountName.simpleText"]) continue;
-              NSLog(@"account -> %@", account);
-              // index++;
-
+              NSString *name = TRTextOf([account[@"accountItem"] objectForKey:@"accountName"]);
+              if (![name length]) continue;
               NSString *pageId = [TRJSONUtils stringFromJSON:account keyPath:@"accountItem.serviceEndpoint.selectActiveIdentityEndpoint.supportedTokens[0].pageIdToken.pageId"];
-              if (!pageId) {
-                pageId = @"None";
-              }
-
-              NSString *accountElement = [NSString stringWithFormat:@"<li class=\"active-session-account\">"
+              if (![pageId length]) pageId = TRFindString(account[@"accountItem"][@"serviceEndpoint"], @"pageId", 0);
+              if (![pageId length]) pageId = @"None";
+              NSString *photo = [TRJSONUtils stringFromJSON:account keyPath:@"accountItem.accountPhoto.thumbnails[0].url"] ?: @"";
+              NSString *handle = TRTextOf([account[@"accountItem"] objectForKey:@"channelHandle"]);
+              [allAccountsHTML appendFormat:@"<li class=\"active-session-account\">"
                                   "<button onclick=\"javascript:selectAccount('%@')\">"
-                                  "<img class=\"account-image\" alt=\"\" src=\"%@\">" // photo
-                                  "<span class=\"account-name\">%@</span>" // name
-                                  "<span class=\"account-email\">%@</span>" // handle
-                                  "</button>"
-                                  "</li>", 
-                                  pageId,
-                                  [TRJSONUtils stringFromJSON:account keyPath:@"accountItem.accountPhoto.thumbnails[0].url"],
-                                  [TRJSONUtils stringFromJSON:account keyPath:@"accountItem.accountName.simpleText"],
-                                  [TRJSONUtils stringFromJSON:account keyPath:@"accountItem.channelHandle.simpleText"]
-              ];
-
-              [allAccountsHTML appendString:accountElement];
+                                  "<img class=\"account-image\" alt=\"\" src=\"%@\">"
+                                  "<span class=\"account-name\">%@</span>"
+                                  "<span class=\"account-email\">%@</span>"
+                                  "</button></li>", TRHTMLEscape(pageId), TRHTMLEscape(photo), TRHTMLEscape(name), TRHTMLEscape(handle)];
+          }
+          if (![allAccountsHTML length]) {
+              // nothing could be read from the answer: still let the sign-in go on with the main account
+              [allAccountsHTML appendString:@"<li class=\"active-session-account\"><button onclick=\"javascript:selectAccount('None')\">"
+                                  "<span class=\"account-name\">Continue</span><span class=\"account-email\">Use your main account</span></button></li>"];
+              NSLog(@"[ReMusic] no accounts could be read, offering the main account");
           }
           NSError *err = nil;
           NSString *baseHTML = [NSString stringWithContentsOfFile:@"/Library/Application Support/ReMusic/account_selector.html" encoding:NSUTF8StringEncoding error:&err];
+          if (![baseHTML length]) {
+              NSLog(@"[ReMusic] account_selector.html could not be read: %@", err);
+              baseHTML = @"<html><head><meta name=\"viewport\" content=\"width=device-width\"></head><body><h2>Choose an account</h2><ol>{{ SPECIAL_TUBEREPLACER_ACCOUNTS_FIELD }}</ol>"
+                         "<script>function selectAccount(id){ document.cookie='tubereplacer_account_selected='+id; window.location.href='https://www.youtube.com/ytscframe'; }</script></body></html>";
+          }
           htmlString = [baseHTML stringByReplacingOccurrencesOfString:@"{{ SPECIAL_TUBEREPLACER_ACCOUNTS_FIELD }}" withString:allAccountsHTML];
-
-
-          htmlString = [htmlString stringByReplacingOccurrencesOfString:@"{{ SPECIAL_TUBEREPLACER_SIDCC_FIELD }}" withString:allAccountsHTML]; // hack!
+          [allAccountsHTML release];
         }
 
         // gets rid of some... problematic cookies for setting profile.
@@ -616,6 +681,54 @@ static BOOL TRProcessSignInCookies(id signIn, id cookieStorage) {
 - (id)auth;
 @end
 
+// ---- request signing variants ----
+// Whether YouTube accepts a cookie signature on the iOS API host could not be tested ahead of time, so a few
+// ways of making the signature are tried in turn: when the server refuses a signed request (401/403) the next
+// way is used for the following requests, and the first way that gets an answer is remembered.
+int gTRAuthVariant = -1;      // -1: not loaded yet
+static BOOL gTRAuthLocked = NO;
+static NSString *const kTRVariantKey = @"ReMusicAuthVariant";
+
+static int TRCurrentVariant(void) {
+    @synchronized ([NSProcessInfo processInfo]) {
+        if (gTRAuthVariant < 0) {
+            gTRAuthVariant = 0;
+            @try {
+                NSNumber *saved = [[NSUserDefaults standardUserDefaults] objectForKey:kTRVariantKey];
+                if ([saved isKindOfClass:[NSNumber class]]) { gTRAuthVariant = [saved intValue] % 4; gTRAuthLocked = YES; }
+            } @catch (NSException *e) {}
+        }
+        return gTRAuthVariant;
+    }
+}
+
+// called with every finished request from the diagnostics module
+void TRAuthResult(NSURLRequest *r, NSURLResponse *resp, NSError *e) {
+    NSURL *u = [r URL] ?: [resp URL];
+    if (![[u host] hasSuffix:@"googleapis.com"] || ![[u path] hasPrefix:@"/youtubei/"]) return;
+    if ([[u path] hasPrefix:@"/youtubei/v1/log_event"] || [[u path] hasSuffix:@"accounts_list"]) return;
+    if (![[r valueForHTTPHeaderField:@"Authorization"] hasPrefix:@"SAPISIDHASH"]) return;
+    long status = [resp isKindOfClass:[NSHTTPURLResponse class]] ? (long)[(NSHTTPURLResponse *)resp statusCode] : 0;
+    if (!status && [[e domain] isEqualToString:@"com.google.HTTPStatus"]) status = (long)[e code];
+    if (!status) return;
+    @synchronized ([NSProcessInfo processInfo]) {
+        int v = TRCurrentVariant();
+        if (status >= 200 && status < 300) {
+            if (!gTRAuthLocked) {
+                gTRAuthLocked = YES;
+                NSLog(@"[ReMusic] signing way %d was accepted (%@ -> %ld), keeping it", v, [u path], status);
+                @try { [[NSUserDefaults standardUserDefaults] setObject:@(v) forKey:kTRVariantKey]; [[NSUserDefaults standardUserDefaults] synchronize]; } @catch (NSException *ex) {}
+            }
+        } else if ((status == 401 || status == 403) && !gTRAuthLocked) {
+            gTRAuthVariant = (v + 1) % 4;
+            NSLog(@"[ReMusic] signing way %d refused (%@ -> %ld), trying way %d next", v, [u path], status, gTRAuthVariant);
+        } else {
+            static int n = 0;
+            if (n++ < 6) NSLog(@"[ReMusic] signed request %@ answered %ld (signing way %d)", [u path], status, v);
+        }
+    }
+}
+
 static BOOL TRApplyCookieAuth(NSDictionary *p, NSMutableURLRequest *request) {
     NSString *sid = p[@"SID"], *hsid = p[@"HSID"], *ssid = p[@"SSID"], *sapisid = p[@"SAPISID"];
     NSString *sidcc = p[@"SIDCC"], *datasyncID = p[@"DATASYNC_ID"], *pageID = p[@"PAGE_ID"], *loginInfo = p[@"LOGIN_INFO"];
@@ -634,11 +747,13 @@ static BOOL TRApplyCookieAuth(NSDictionary *p, NSMutableURLRequest *request) {
     NSURL *u = [request URL];
     // the web origin the signature is made for: the API host itself is not one, so use Music's
     NSString *origin = [NSString stringWithFormat:@"%@://%@", [u scheme], [u host]];
-    if ([[u host] hasSuffix:@"googleapis.com"]) origin = @"https://music.youtube.com";
+    int variant = TRCurrentVariant();
+    if ([[u host] hasSuffix:@"googleapis.com"]) origin = (variant & 1) ? @"https://www.youtube.com" : @"https://music.youtube.com";
     long now = (long)[[NSDate date] timeIntervalSince1970];
     NSString *toHash = nil;
     for (NSString *c in [datasyncID componentsSeparatedByString:@"||"]) if ([c length]) toHash = c;
-    NSString *src = [toHash length]
+    BOOL withUser = [toHash length] && !(variant & 2); // the newer form signs the user session id too
+    NSString *src = withUser
         ? [NSString stringWithFormat:@"%@ %ld %@ %@", toHash, now, sapisid, origin]
         : [NSString stringWithFormat:@"%ld %@ %@", now, sapisid, origin];
     NSData *sd = [src dataUsingEncoding:NSUTF8StringEncoding];
@@ -646,8 +761,9 @@ static BOOL TRApplyCookieAuth(NSDictionary *p, NSMutableURLRequest *request) {
     CC_SHA1([sd bytes], (CC_LONG)[sd length], dg);
     NSMutableString *hex = [NSMutableString string];
     for (int i = 0; i < CC_SHA1_DIGEST_LENGTH; i++) [hex appendFormat:@"%02x", dg[i]];
-    [request setValue:[NSString stringWithFormat:@"SAPISIDHASH %ld_%@_u", now, hex] forHTTPHeaderField:@"Authorization"];
+    [request setValue:[NSString stringWithFormat:@"SAPISIDHASH %ld_%@%@", now, hex, withUser ? @"_u" : @""] forHTTPHeaderField:@"Authorization"];
     [request setValue:origin forHTTPHeaderField:@"Origin"];
+    [request setValue:origin forHTTPHeaderField:@"X-Origin"];
     [request setValue:@"0" forHTTPHeaderField:@"X-Goog-AuthUser"];
     if ([pageID length]) [request setValue:pageID forHTTPHeaderField:@"X-Goog-PageId"];
     return YES;
