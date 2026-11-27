@@ -1,4 +1,4 @@
-# ReMusic 0.1.2
+# ReMusic 0.1.3
 Cookie-based sign-in for old YouTube Music (3.47.4, iOS 10), reusing TubeReplacer's sign-in code
 (https://github.com/Preloading/TubeReplacer by Preloading, GPLv3). This project is GPLv3 too.
 
@@ -16,3 +16,9 @@ Music app's Documents folder (next to TubeReplacer.log):
 Music flash sign-in errors. If Music's Documents folder has no ReMusic-session.marker, the stored accounts are
 forgotten once at launch (and the marker is written), so you can sign in cleanly. To force it again, create an
 empty file called ReMusic-reset in the same folder. Tracing is skipped on that first launch.
+
+0.1.3: with nobody signed in, Music asks YouTube for the account list as soon as it opens, gets "400 Precondition
+check failed" and asks again about five times a second (this made the sign-in error flash). That one request is
+now answered locally with an empty list when it carries no sign-in (ReMusic-fix.disabled is created if the fix
+ever crashes the app). The log also shows who made each request (BACKTRACE lines), block signatures, and no
+longer fills up with repeats.

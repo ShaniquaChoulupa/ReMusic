@@ -1,5 +1,5 @@
 // ReMusicDiag.m
-// ReMusic 0.1.2 - diagnostics for finding out how YouTube Music 3.47.4 sends its requests.
+// ReMusic 0.1.3 - diagnostics for finding out how YouTube Music 3.47.4 sends its requests.
 //
 // Writes two files into the app's Documents folder (next to TubeReplacer.log):
 //   ReMusic-methods.txt  - method + ivar list of the networking classes (written ~6s after launch)
@@ -17,6 +17,8 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <dispatch/dispatch.h>
+#include <dlfcn.h>
+#include <mach-o/dyld.h>
 
 // ---------------------------------------------------------------------------------------------
 // Log file
@@ -169,9 +171,27 @@ static NSString *RMRespSummary(NSURLResponse *r, NSData *d, NSError *e) {
     return s;
 }
 
+// a request that repeats hundreds of times only needs to be written a few times
+static BOOL RMRepeatAllowed(NSString *kind, NSURL *u) {
+    if (!gRMLogLock) return YES;
+    @synchronized (gRMLogLock) {
+        static NSMutableDictionary *counts = nil;
+        if (!counts) counts = [[NSMutableDictionary alloc] init];
+        NSString *key = [NSString stringWithFormat:@"%@ %@%@", kind, [u host], [u path]];
+        NSUInteger n = [[counts objectForKey:key] unsignedIntegerValue] + 1;
+        [counts setObject:[NSNumber numberWithUnsignedInteger:n] forKey:key];
+        if (n <= 4) return YES;
+        if (n % 250 == 0) {
+            RMDiagLog(@"(%@ %@ has now happened %lu times, not logging each one)", kind, [u path], (unsigned long)n);
+        }
+        return NO;
+    }
+}
+
 static void RMLogReq(NSString *tag, NSURLRequest *r) {
     @try {
         if (RMNoisyURL([r URL])) return;
+        if (!RMRepeatAllowed(tag, [r URL])) return;
         RMDiagLog(@"%@ %@", tag, RMReqSummary(r));
     } @catch (NSException *e) {
     }
@@ -180,6 +200,7 @@ static void RMLogReq(NSString *tag, NSURLRequest *r) {
 static void RMLogResp(NSString *tag, NSURLRequest *r, NSURLResponse *resp, NSData *d, NSError *e) {
     @try {
         if (RMNoisyURL([r URL]) || RMNoisyURL([resp URL])) return;
+        if (!RMRepeatAllowed([tag stringByAppendingString:@" done"], [r URL] ?: [resp URL])) return;
         RMDiagLog(@"%@ done %@\n    %@", tag, [[r URL] absoluteString] ?: [[resp URL] absoluteString], RMRespSummary(resp, d, e));
     } @catch (NSException *ex) {
     }
@@ -368,6 +389,66 @@ static int gRMTraceTotal = 0;
 static const int kRMTracePerSel = 10;
 static const int kRMTraceMax = 2500;
 
+// ---------------------------------------------------------------------------------------------
+// Block helpers (read a block's signature, call a block that takes only objects)
+// ---------------------------------------------------------------------------------------------
+
+struct RMBlockDesc {
+    unsigned long reserved;
+    unsigned long size;
+};
+struct RMBlock {
+    void *isa;
+    int flags;
+    int reserved;
+    void *invoke;
+    struct RMBlockDesc *descriptor;
+};
+
+static const char *RMBlockSigC(id blk) {
+    if (!blk) return NULL;
+    uintptr_t p = (uintptr_t)blk;
+    if (p < 0x1000 || (p & 3)) return NULL;
+    struct RMBlock *b = (struct RMBlock *)blk;
+    if (!(b->flags & (1 << 30))) return NULL;  // BLOCK_HAS_SIGNATURE
+    const char *base = (const char *)b->descriptor;
+    if (!base) return NULL;
+    const char **sp = (const char **)(base + 2 * sizeof(unsigned long));
+    if (b->flags & (1 << 25)) sp += 2;  // BLOCK_HAS_COPY_DISPOSE: skip the copy and dispose pointers
+    return *sp;
+}
+
+static NSString *RMBlockSig(id blk) {
+    const char *s = RMBlockSigC(blk);
+    return s ? [NSString stringWithUTF8String:s] : @"no-signature";
+}
+
+// number of parameters when every one of them is an object, otherwise -1
+static int RMBlockObjectParams(id blk) {
+    const char *sig = RMBlockSigC(blk);
+    if (!sig) return -1;
+    @try {
+        NSMethodSignature *ms = [NSMethodSignature signatureWithObjCTypes:sig];
+        NSUInteger n = [ms numberOfArguments];
+        for (NSUInteger i = 1; i < n; i++) {
+            const char *t = [ms getArgumentTypeAtIndex:i];
+            if (!t || t[0] != '@') return -1;
+        }
+        return (int)n - 1;
+    } @catch (NSException *e) {
+        return -1;
+    }
+}
+
+static void RMCallBlock(id blk, int n, id a, id b, id c) {
+    switch (n) {
+        case 1: ((void (^)(id))blk)(a); break;
+        case 2: ((void (^)(id, id))blk)(a, b); break;
+        case 3: ((void (^)(id, id, id))blk)(a, b, c); break;
+        default: break;
+    }
+}
+
 static NSString *RMDescribe(id o) {
     if (!o) return @"nil";
     uintptr_t p = (uintptr_t)o;
@@ -406,7 +487,7 @@ static NSString *RMDescribe(id o) {
 static NSString *RMArg(char kind, char blk, uintptr_t v) {
     switch (kind) {
         case '@':
-            if (blk) return v ? @"<block>" : @"nil";
+            if (blk) return v ? [NSString stringWithFormat:@"<block %@>", RMBlockSig((id)v)] : @"nil";
             return RMDescribe((id)v);
         case '#':
             return v ? [NSString stringWithFormat:@"%s", class_getName((Class)v)] : @"Nil";
@@ -431,6 +512,126 @@ static NSString *RMArg(char kind, char blk, uintptr_t v) {
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// Who called this? Backtraces are captured when they happen and turned into method names later.
+// ---------------------------------------------------------------------------------------------
+
+static NSMutableArray *gRMBacktraces = nil;
+
+static void RMCaptureBacktrace(NSString *label) {
+    if (!gRMLogLock) return;
+    @synchronized (gRMLogLock) {
+        if (!gRMBacktraces) gRMBacktraces = [[NSMutableArray alloc] init];
+        if ([gRMBacktraces count] >= 40) return;
+        NSArray *addrs = [NSThread callStackReturnAddresses];
+        [gRMBacktraces addObject:[NSDictionary dictionaryWithObjectsAndKeys:label, @"label", addrs, @"addrs", nil]];
+    }
+}
+
+typedef struct {
+    uintptr_t imp;
+    Class cls;
+    SEL sel;
+    char meta;
+} RMSym;
+
+static int RMSymCmp(const void *a, const void *b) {
+    uintptr_t x = ((const RMSym *)a)->imp, y = ((const RMSym *)b)->imp;
+    return x < y ? -1 : (x > y ? 1 : 0);
+}
+
+static NSString *RMBaseName(const char *path) {
+    if (!path) return @"";
+    const char *slash = strrchr(path, '/');
+    return [NSString stringWithUTF8String:slash ? slash + 1 : path];
+}
+
+static void RMSymbolizeBacktraces(void) {
+    @try {
+        NSArray *traces = nil;
+        @synchronized (gRMLogLock) {
+            traces = [NSArray arrayWithArray:gRMBacktraces];
+        }
+        if (![traces count]) {
+            RMDiagLog(@"backtrace: none captured");
+            return;
+        }
+        NSString *exeName = RMBaseName([[[NSBundle mainBundle] executablePath] UTF8String]);
+        int total = objc_getClassList(NULL, 0);
+        Class *all = (Class *)malloc(sizeof(Class) * (size_t)(total + 16));
+        if (!all) return;
+        total = objc_getClassList(all, total);
+        size_t cap = 120000, n = 0;
+        RMSym *tab = (RMSym *)malloc(cap * sizeof(RMSym));
+        if (!tab) {
+            free(all);
+            return;
+        }
+        for (int i = 0; i < total; i++) {
+            const char *img = class_getImageName(all[i]);
+            if (!img || ![RMBaseName(img) isEqualToString:exeName]) continue;
+            for (int pass = 0; pass < 2; pass++) {
+                Class k = pass ? object_getClass(all[i]) : all[i];
+                unsigned int cnt = 0;
+                Method *ms = class_copyMethodList(k, &cnt);
+                for (unsigned int j = 0; j < cnt; j++) {
+                    if (n == cap) {
+                        cap *= 2;
+                        RMSym *nt = (RMSym *)realloc(tab, cap * sizeof(RMSym));
+                        if (!nt) break;
+                        tab = nt;
+                    }
+                    tab[n].imp = ((uintptr_t)method_getImplementation(ms[j])) & ~(uintptr_t)1;
+                    tab[n].cls = all[i];
+                    tab[n].sel = method_getName(ms[j]);
+                    tab[n].meta = (char)pass;
+                    n++;
+                }
+                if (ms) free(ms);
+            }
+        }
+        free(all);
+        qsort(tab, n, sizeof(RMSym), RMSymCmp);
+        RMDiagLog(@"backtrace: %lu app methods indexed, image slide 0x%lx", (unsigned long)n, (unsigned long)_dyld_get_image_vmaddr_slide(0));
+        for (NSDictionary *t in traces) {
+            NSMutableString *out = [NSMutableString stringWithFormat:@"BACKTRACE for %@", [t objectForKey:@"label"]];
+            int idx = 0;
+            for (NSNumber *num in [t objectForKey:@"addrs"]) {
+                uintptr_t addr = (uintptr_t)[num unsignedLongValue];
+                uintptr_t a = addr & ~(uintptr_t)1;
+                // greatest method start that is not above this address
+                long lo = 0, hi = (long)n - 1, best = -1;
+                while (lo <= hi) {
+                    long mid = (lo + hi) / 2;
+                    if (tab[mid].imp <= a) {
+                        best = mid;
+                        lo = mid + 1;
+                    } else {
+                        hi = mid - 1;
+                    }
+                }
+                if (best >= 0 && a - tab[best].imp < 0x6000) {
+                    [out appendFormat:@"\n    #%d %c[%s %s] +0x%lx  (0x%lx)", idx, tab[best].meta ? '+' : '-', class_getName(tab[best].cls),
+                     sel_getName(tab[best].sel), (unsigned long)(a - tab[best].imp), (unsigned long)addr];
+                } else {
+                    Dl_info di;
+                    if (dladdr((void *)addr, &di) && di.dli_sname) {
+                        [out appendFormat:@"\n    #%d %s  (0x%lx)", idx, di.dli_sname, (unsigned long)addr];
+                    } else {
+                        [out appendFormat:@"\n    #%d 0x%lx", idx, (unsigned long)addr];
+                    }
+                }
+                idx++;
+                if (idx >= 24) break;
+            }
+            RMDiagLog(@"%@", out);
+        }
+        free(tab);
+    } @catch (NSException *e) {
+        RMDiagLog(@"backtrace: failed %@", e);
+    }
+}
+
 static void RMLogCall(RMTrace *t, id self_, uintptr_t *a) {
     NSMutableString *s = [NSMutableString stringWithFormat:@"CALL -[%s %s]", t->cls, sel_getName(t->sel)];
     [s appendFormat:@"\n    self=<%s %p>", object_getClassName(self_), self_];
@@ -438,6 +639,11 @@ static void RMLogCall(RMTrace *t, id self_, uintptr_t *a) {
         [s appendFormat:@"\n    arg%d(%c%s)=%@", i + 1, t->kinds[i], t->isBlock[i] ? "?" : "", RMArg(t->kinds[i], t->isBlock[i], a[i])];
     }
     RMDiagLog(@"%@", s);
+    // who is asking? (first few requests, and the first call of every method of the account-list service)
+    if ((strncmp(sel_getName(t->sel), "makeInnerTubeRequest:", 21) == 0 && t->count < 4) ||
+        (strcmp(t->cls, "YTAccountsListService") == 0 && t->count < 1)) {
+        RMCaptureBacktrace([NSString stringWithFormat:@"-[%s %s]", t->cls, sel_getName(t->sel)]);
+    }
 }
 
 static BOOL RMKindOK(const char *enc, BOOL allowVoid) {
@@ -567,7 +773,8 @@ static void RMInstallTracer(void) {
         "YTSearchService", "YTPlayerService", "YTBrowseService", "YTHotSwappableFetcherServiceAndURLBuilder",
         "YTFetcherTaskConfiguration", "GTMSessionFetcherService", "YTGRPCFetcherService", "YTGRPCFetcherTask",
         "GRPCProtoMethod", "GRPCUnaryProtoCall", "GRPCStreamingProtoCall", "GRPCProtoCall", "YTApiaryDeviceAuthenticator",
-        "YTAuthorizedUrlHandler", NULL};
+        "YTAuthorizedUrlHandler", "YTAccountsListService", "YTGaiaSignInController", "YTIdentityController",
+        "YTIdentityRetriever", "YTIdentityRestorer", "YTFirstTimeSignInController", "YTMGaiaIdentityService", NULL};
     for (int i = 0; names[i]; i++) {
         Class c = objc_getClass(names[i]);
         if (!c) {
@@ -600,6 +807,9 @@ static BOOL RMWantDump(const char *n) {
     if (RMStarts(n, "YTM") && (RMEnds(n, "Service") || RMEnds(n, "Requestor") || RMEnds(n, "Coordinator") || RMEnds(n, "Fetcher"))) return YES;
     if (RMStarts(n, "YT") && RMEnds(n, "Service")) return YES;
     if (RMStarts(n, "YTGRPC") || RMStarts(n, "YTApiary") || RMStarts(n, "YTAuthorized")) return YES;
+    if (RMStarts(n, "YTIdentity") || RMStarts(n, "YTAccountsList") || RMStarts(n, "YTGaiaSignIn") || RMStarts(n, "YTFirstTimeSignIn") ||
+        RMStarts(n, "YTMGaia") || RMStarts(n, "YTNetworkRetry") || RMStarts(n, "YTApiaryResource"))
+        return YES;
     static const char *exact[] = {
         "GTMSessionFetcher", "GTMSessionFetcherService", "YTFetcherTaskConfiguration", "YTHotSwappableFetcherServiceAndURLBuilder",
         "YTHotConfig", "YTIBrowseRequest", "YTIBrowseResponse", "YTISearchRequest", "YTISearchResponse", "YTIPlayerRequest",
@@ -658,7 +868,7 @@ static void RMWriteMethodDump(void) {
 
         NSMutableString *out = [NSMutableString stringWithCapacity:600000];
         NSDictionary *info = [[NSBundle mainBundle] infoDictionary];
-        [out appendFormat:@"ReMusic 0.1.2 method dump\napp %@ (%@)  iOS %@  %d classes loaded, %lu dumped\n",
+        [out appendFormat:@"ReMusic 0.1.3 method dump\napp %@ (%@)  iOS %@  %d classes loaded, %lu dumped\n",
          [info objectForKey:@"CFBundleShortVersionString"], [info objectForKey:@"CFBundleIdentifier"],
          [[NSProcessInfo processInfo] operatingSystemVersionString], total, (unsigned long)[sorted count]];
 
@@ -785,6 +995,83 @@ static void RMInstallReset(void) {
 }
 
 // ---------------------------------------------------------------------------------------------
+// accounts_list loop breaker
+//
+// With nobody signed in, Music asks YouTube for the account list the moment it opens. YouTube answers
+// "400 Precondition check failed" and Music immediately asks again, about five times a second, which
+// is what makes the sign-in error flash. When that request has no authorizer (nobody signed in) it is
+// answered locally with an empty list instead of being sent. Requests that carry a sign-in are never touched.
+// ---------------------------------------------------------------------------------------------
+
+static IMP rm_o_phr = NULL;
+static int gRMFakeCount = 0;
+static BOOL gRMFakeOn = NO;
+
+static id rm_phr(id self, SEL _cmd, NSURLRequest *req, id authorizer, id respBlock, id errBlock, id retry) {
+    @try {
+        NSString *path = [[req URL] path];
+        if (gRMFakeOn && !authorizer && respBlock && [path hasSuffix:@"/account/accounts_list"]) {
+            int np = RMBlockObjectParams(respBlock);
+            if (np >= 1 && np <= 3) {
+                int k = ++gRMFakeCount;
+                double delay = k <= 3 ? 0.2 : 30.0;  // after a few quick answers, slow any further retries right down
+                id blk = [respBlock copy];
+                NSString *sig = RMBlockSig(blk);
+                BOOL wantsResponse = [sig rangeOfString:@"URLResponse"].location != NSNotFound;
+                NSURL *url = [req URL];
+                RMDiagLog(@"fix: accounts_list with nobody signed in answered locally (#%d), response block %@, delay %.1fs", k, sig, delay);
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)), dispatch_get_global_queue(0, 0), ^{
+                    @try {
+                        id resp = nil;
+                        if (wantsResponse) resp = [[[NSHTTPURLResponse alloc] initWithURL:url statusCode:200 HTTPVersion:@"HTTP/1.1"
+                                                                             headerFields:nil] autorelease];
+                        RMCallBlock(blk, np, [NSData data], resp, nil);
+                    } @catch (NSException *e) {
+                        RMDiagLog(@"fix: calling the response block failed: %@", e);
+                    }
+                    [blk release];
+                });
+                return nil;
+            }
+            RMDiagLog(@"fix: accounts_list seen but the response block %@ is not one I can call, passing it on", RMBlockSig(respBlock));
+        }
+    } @catch (NSException *e) {
+    }
+    return ((id (*)(id, SEL, id, id, id, id, id))rm_o_phr)(self, _cmd, req, authorizer, respBlock, errBlock, retry);
+}
+
+// switches a feature off for good if the launch that used it crashed in its first 10 seconds
+static BOOL RMGuardStart(NSString *name) {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *disabled = RMPath([NSString stringWithFormat:@"ReMusic-%@.disabled", name]);
+    NSString *pending = RMPath([NSString stringWithFormat:@"ReMusic-%@.pending", name]);
+    NSString *ok = RMPath([NSString stringWithFormat:@"ReMusic-%@.ok", name]);
+    if ([fm fileExistsAtPath:disabled]) {
+        RMDiagLog(@"%@: OFF (ReMusic-%@.disabled exists - delete it, ReMusic-%@.pending and ReMusic-%@.ok to turn it back on)", name, name, name, name);
+        return NO;
+    }
+    if ([fm fileExistsAtPath:pending] && ![fm fileExistsAtPath:ok]) {
+        [fm createFileAtPath:disabled contents:nil attributes:nil];
+        RMDiagLog(@"%@: OFF - the last launch with it on did not get through its first 10 seconds", name);
+        return NO;
+    }
+    [fm removeItemAtPath:ok error:nil];
+    [fm createFileAtPath:pending contents:nil attributes:nil];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC), dispatch_get_global_queue(0, 0), ^{
+        [[NSFileManager defaultManager] createFileAtPath:ok contents:nil attributes:nil];
+    });
+    return YES;
+}
+
+static void RMInstallAccountsListFix(void) {
+    if (!RMGuardStart(@"fix")) return;
+    Class c = objc_getClass("YTBaseNetworkService");
+    SEL sel = NSSelectorFromString(@"performHTTPRequest:withAuthorizer:responseBlock:errorBlock:retryConfig:");
+    gRMFakeOn = RMReplace(c, sel, (IMP)rm_phr, &rm_o_phr);
+    RMDiagLog(@"fix: accounts_list interceptor installed: %d", gRMFakeOn);
+}
+
+// ---------------------------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------------------------
 
@@ -794,7 +1081,7 @@ __attribute__((constructor)) static void RMDiagInit(void) {
             pthread_key_create(&gRMBusyKey, NULL);
             RMSetupLog();
             NSDictionary *info = [[NSBundle mainBundle] infoDictionary];
-            RMDiagLog(@"ReMusic 0.1.2 diagnostics start. app %@ bundle %@", [info objectForKey:@"CFBundleShortVersionString"],
+            RMDiagLog(@"ReMusic 0.1.3 diagnostics start. app %@ bundle %@", [info objectForKey:@"CFBundleShortVersionString"],
                       [info objectForKey:@"CFBundleIdentifier"]);
             static const char *key[] = {"YTInnerTubeRequestor", "YTMInnerTubeRequestor", "YTBaseInnerTubeService", "YTGRPCFetcherService",
                                         "YTGRPCFetcherTask", "GTMSessionFetcher", "Cronet", "GRPCCall2", "YTInnerTubeURLBuilderGRPC",
@@ -807,8 +1094,12 @@ __attribute__((constructor)) static void RMDiagInit(void) {
             } else {
                 RMInstallTracer();
             }
+            RMInstallAccountsListFix();
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 6 * NSEC_PER_SEC), dispatch_get_global_queue(0, 0), ^{
                 RMWriteMethodDump();
+            });
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 12 * NSEC_PER_SEC), dispatch_get_global_queue(0, 0), ^{
+                RMSymbolizeBacktraces();
             });
         } @catch (NSException *e) {
         }
