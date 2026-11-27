@@ -1,4 +1,4 @@
-# ReMusic 0.1.4
+# ReMusic 0.1.5
 Cookie-based sign-in for old YouTube Music (3.47.4, iOS 10), reusing TubeReplacer's sign-in code
 (https://github.com/Preloading/TubeReplacer by Preloading, GPLv3). This project is GPLv3 too.
 
@@ -30,3 +30,8 @@ SAPISIDHASH header instead, as TubeReplacer does for the YouTube app. A copy of 
 kept in the keychain (service ReMusic.account) in case the sign-in library does not hand them back after a
 relaunch; the fresh-install reset removes it. ReMusic-diag.log shows the server's answer (HTTP status) to each
 request, so it shows whether YouTube accepts requests authorized this way.
+
+0.1.5: after a relaunch the sign-in library does not return the cookie fields of an account that signed in before
+0.1.4, so requests still could not be authorized. They are now rebuilt from the cookie jar the sign-in used and the
+account id the identity stores, so no new sign-in is needed. Only the SAPISID cookie is required; the rest is sent if
+present. ReMusic-diag.log shows the server's answer to each request.

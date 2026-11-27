@@ -1,6 +1,6 @@
 Package: dev.remusic.tweak
 Name: ReMusic
-Version: 0.1.4
+Version: 0.1.5
 Architecture: iphoneos-arm
 Description: Cookie-based sign-in for old YouTube Music (based on TubeReplacer by Preloading, GPLv3)
 Maintainer: Jeremy

@@ -619,11 +619,17 @@ static BOOL TRProcessSignInCookies(id signIn, id cookieStorage) {
 static BOOL TRApplyCookieAuth(NSDictionary *p, NSMutableURLRequest *request) {
     NSString *sid = p[@"SID"], *hsid = p[@"HSID"], *ssid = p[@"SSID"], *sapisid = p[@"SAPISID"];
     NSString *sidcc = p[@"SIDCC"], *datasyncID = p[@"DATASYNC_ID"], *pageID = p[@"PAGE_ID"], *loginInfo = p[@"LOGIN_INFO"];
-    if (![hsid length] || ![ssid length] || ![sapisid length] || ![sid length] || ![datasyncID length] || !request) return NO;
+    NSString *extra = p[@"COOKIES"];
+    if (![sapisid length] || !request) return NO;
     [request setHTTPShouldHandleCookies:NO];
-    NSMutableString *cookie = [NSMutableString stringWithFormat:@"hideBrowserUpgradeBox=true; HSID=%@; SSID=%@; SAPISID=%@; __Secure-3PAPISID=%@; SID=%@", hsid, ssid, sapisid, sapisid, sid];
+    NSMutableString *cookie = [NSMutableString stringWithString:@"hideBrowserUpgradeBox=true"];
+    if ([hsid length]) [cookie appendFormat:@"; HSID=%@", hsid];
+    if ([ssid length]) [cookie appendFormat:@"; SSID=%@", ssid];
+    [cookie appendFormat:@"; SAPISID=%@; __Secure-3PAPISID=%@", sapisid, sapisid];
+    if ([sid length]) [cookie appendFormat:@"; SID=%@", sid];
     if ([sidcc length]) [cookie appendFormat:@"; SIDCC=%@", sidcc];
     if ([loginInfo length]) [cookie appendFormat:@"; LOGIN_INFO=%@", loginInfo];
+    if ([extra length]) [cookie appendFormat:@"; %@", extra];
     [request setValue:cookie forHTTPHeaderField:@"Cookie"];
     NSURL *u = [request URL];
     // the web origin the signature is made for: the API host itself is not one, so use Music's
@@ -632,7 +638,9 @@ static BOOL TRApplyCookieAuth(NSDictionary *p, NSMutableURLRequest *request) {
     long now = (long)[[NSDate date] timeIntervalSince1970];
     NSString *toHash = nil;
     for (NSString *c in [datasyncID componentsSeparatedByString:@"||"]) if ([c length]) toHash = c;
-    NSString *src = [NSString stringWithFormat:@"%@ %ld %@ %@", toHash, now, sapisid, origin];
+    NSString *src = [toHash length]
+        ? [NSString stringWithFormat:@"%@ %ld %@ %@", toHash, now, sapisid, origin]
+        : [NSString stringWithFormat:@"%ld %@ %@", now, sapisid, origin];
     NSData *sd = [src dataUsingEncoding:NSUTF8StringEncoding];
     uint8_t dg[CC_SHA1_DIGEST_LENGTH];
     CC_SHA1([sd bytes], (CC_LONG)[sd length], dg);
@@ -645,11 +653,60 @@ static BOOL TRApplyCookieAuth(NSDictionary *p, NSMutableURLRequest *request) {
     return YES;
 }
 
+// The sign-in library does not give our cookie fields back after the app is relaunched, and the keychain copy
+// only exists for sign-ins made after it was added. Rebuild them from what the app still has: the cookie jar
+// of the sign-in web view, and the account id the identity stores (we saved the data-sync id as the user id).
+static NSDictionary *TRParamsFromCookieJar(id ident) {
+    NSMutableDictionary *p = [NSMutableDictionary dictionary];
+    NSMutableDictionary *others = [NSMutableDictionary dictionary];
+    NSMutableArray *names = [NSMutableArray array];
+    NSHTTPCookieStorage *cs = [NSHTTPCookieStorage sharedHTTPCookieStorage];
+    for (NSString *u in @[@"https://m.youtube.com/ytscframe", @"https://www.youtube.com/", @"https://music.youtube.com/",
+                          @"https://accounts.google.com/", @"https://www.google.com/"]) {
+        for (NSHTTPCookie *c in [cs cookiesForURL:[NSURL URLWithString:u]]) {
+            NSString *n = [c name], *v = [c value];
+            if (![n length] || ![v length]) continue;
+            if (![names containsObject:n]) [names addObject:n];
+            if ([n isEqualToString:@"SID"] || [n isEqualToString:@"HSID"] || [n isEqualToString:@"SSID"] ||
+                [n isEqualToString:@"SIDCC"] || [n isEqualToString:@"LOGIN_INFO"]) {
+                if (!p[n]) p[n] = v;
+            } else if ([n isEqualToString:@"SAPISID"]) {
+                p[@"SAPISID"] = v;
+            } else if ([n isEqualToString:@"__Secure-3PAPISID"]) {
+                if (!p[@"SAPISID"]) p[@"SAPISID"] = v;
+            } else if ([n isEqualToString:@"tubereplacer_account_selected"]) {
+                if (![v isEqualToString:@"None"]) p[@"PAGE_ID"] = v;
+            } else if (!others[n]) {
+                others[n] = v;
+            }
+        }
+    }
+    NSString *uid = nil;
+    @try { uid = [ident respondsToSelector:@selector(userID)] ? [ident performSelector:@selector(userID)] : nil; } @catch (NSException *e) {}
+    if ([uid isKindOfClass:[NSString class]] && [uid length] && [uid rangeOfString:@"@"].location == NSNotFound) p[@"DATASYNC_ID"] = uid;
+    NSMutableArray *parts = [NSMutableArray array];
+    NSUInteger total = 0;
+    for (NSString *n in others) {
+        NSString *part = [NSString stringWithFormat:@"%@=%@", n, others[n]];
+        if (total + [part length] > 3500) break;
+        total += [part length];
+        [parts addObject:part];
+    }
+    if ([parts count]) p[@"COOKIES"] = [parts componentsJoinedByString:@"; "];
+    static int n = 0;
+    if (n++ < 2)
+        NSLog(@"[ReMusic] rebuilt the account from the cookie jar: cookies [%@] SID=%d HSID=%d SSID=%d SAPISID=%d datasync=%@ (%lu chars)",
+              [names componentsJoinedByString:@","], [p[@"SID"] length] > 0, [p[@"HSID"] length] > 0, [p[@"SSID"] length] > 0,
+              [p[@"SAPISID"] length] > 0, [p[@"DATASYNC_ID"] length] ? @"yes" : @"no", (unsigned long)[p[@"DATASYNC_ID"] length]);
+    return [p[@"SAPISID"] length] ? p : nil;
+}
+
 // the signed-in account's cookie fields: from the identity's own login authorization, or the last sign-in as a fallback
 static NSDictionary *TRScopedParams(id scoped) {
     NSDictionary *p = nil;
+    id ident = nil;
     @try {
-        id ident = [scoped respondsToSelector:@selector(identity)] ? [scoped identity] : nil;
+        ident = [scoped respondsToSelector:@selector(identity)] ? [scoped identity] : nil;
         id la = [ident respondsToSelector:@selector(auth)] ? [ident auth] : nil;
         if (la) p = TRParams(la);
     } @catch (NSException *e) {}
@@ -659,6 +716,7 @@ static NSDictionary *TRScopedParams(id scoped) {
         static int n = 0;
         if (n++ < 3) NSLog(@"[ReMusic] account fields were not in the identity, keychain copy %@", [p[@"SAPISID"] length] ? @"found" : @"missing");
     }
+    if (![p[@"SAPISID"] length]) p = TRParamsFromCookieJar(ident);
     return p;
 }
 
@@ -666,7 +724,7 @@ static NSDictionary *TRScopedParams(id scoped) {
 
 -(BOOL)canAuthorize {
     NSDictionary *p = TRScopedParams(self);
-    return [p[@"SID"] length] && [p[@"SAPISID"] length] && [p[@"DATASYNC_ID"] length];
+    return [p[@"SAPISID"] length] > 0;
 }
 
 -(BOOL)hasToken { return YES; }
